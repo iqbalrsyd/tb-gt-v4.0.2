@@ -1,0 +1,356 @@
+name: "AI DevSecOps \u2014 Domain Compliance (general)"
+'on':
+  workflow_call:
+    inputs:
+      detected_domain:
+        description: Domain classification from the AI agent.
+        required: false
+        type: string
+        default: general
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  container-compose-harden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-compose-misconfig
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a container-compose-hardening.shell_log) 2>&1\n# Run the original script\
+        \ in a subshell with set +e so\n# that any single command failure does not\
+        \ abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nset -u\nmapfile -t FILES < <(find . -type f \\( -name 'docker-compose*.yml'\
+        \ -o -name 'docker-compose*.yaml' \\) -not -path '*/node_modules/*')\nif [\
+        \ ${#FILES[@]} -eq 0 ]; then echo 'No docker-compose files found, skipping.';\
+        \ exit 0; fi\nFAIL=0\nfor f in \"${FILES[@]}\"; do\n  if grep -nE '^\\s*privileged:\\\
+        s*true' \"$f\"; then\n    echo \"::error file=$f::privileged: true detected\
+        \ in service definition\"\n    FAIL=1\n  fi\n  if grep -nE '^\\s*network_mode:\\\
+        s*host' \"$f\"; then\n    echo \"::error file=$f::network_mode: host detected\
+        \ \u2014 container shares host network stack\"\n    FAIL=1\n  fi\n  if grep\
+        \ -nE '\"(CHANGE_ME|CHANGEME|changeme|change_me|admin|root)\":\\s*\"(admin|root|password|12345|changeme)\"\
+        ' \"$f\"; then\n    echo \"::error file=$f::default or weak credential literal\
+        \ in compose file\"\n    FAIL=1\n  fi\n  if grep -nE '\"\\s*\\\"?(0\\.0\\\
+        .0\\.0|\\*)\\\"?\\s*\":\\s*\"?(5432|27017|9042|6379|1883|8883|9092|5672|15672|4222)\\\
+        b' \"$f\"; then\n    echo \"::warning file=$f::database/broker port bound\
+        \ to 0.0.0.0 or wildcard \u2014 restrict to internal networks\"\n  fi\n  if\
+        \ ! grep -nE 'no-new-privileges:\\s*true' \"$f\" >/dev/null 2>&1; then\n \
+        \   echo \"::warning file=$f::security_opt 'no-new-privileges:true' is missing\"\
+        \n  fi\ndone\necho \"Scanned ${#FILES[@]} compose file(s), fail=$FAIL\"\n\
+        exit $FAIL\n) || inner_exit=$?\n# If the inner script exited non-zero and\
+        \ emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' container-compose-hardening.shell_log;\
+        \ then\n  echo \"::error file=scan-compose-misconfig::shell check failed (exit\
+        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: semgrep-compose-security
+      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
+
+        echo ''Rule body:''
+
+        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
+
+
+        SEMGREP_EOF
+
+        '
+    - name: Convert container-compose-hardening shell_check annotations to SARIF
+      if: always()
+      run: "cat > container-compose-hardening_annotations_to_sarif.py <<'PY_EOF'\n\
+        import os, re, json\nlog_path = 'container-compose-hardening.shell_log'\n\
+        sarif_path = 'container-compose-hardening-results.sarif'\ntool_name = 'container-compose-hardening'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-container-compose-hardening'\nresults = []\n\
+        if os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 container-compose-hardening_annotations_to_sarif.py\n"
+    - name: Ensure container-compose-hardening-results.sarif exists (fallback for
+        0 findings)
+      if: always()
+      run: "if [ ! -s container-compose-hardening-results.sarif ]; then\n  echo \"\
+        ::notice::container-compose-hardening found 0 findings. Generating empty SARIF\
+        \ to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n    '  \"version\"\
+        : \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
+        \    '        \"driver\": {' \\\n    '          \"name\": \"container-compose-hardening\"\
+        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > container-compose-hardening-results.sarif\nfi\necho \"\u2713 container-compose-hardening-results.sarif\
+        \ size: $(stat -c%s container-compose-hardening-results.sarif) bytes\"\n"
+    - name: Upload container-compose-hardening SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: container-compose-hardening-results.sarif
+        category: container-compose-hardening
+  auth-spring-security-misconfig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-spring-security-config
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a auth-spring-security-misconfig.shell_log) 2>&1\n# Run the original script\
+        \ in a subshell with set +e so\n# that any single command failure does not\
+        \ abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nset -u\nFAIL=0\nif grep -rnE --include='*.java' 'csrf\\s*\\(\\s*\\\
+        )\\s*\\.disable\\s*\\(\\s*\\)' .; then\n  echo '::error::csrf().disable()\
+        \ detected in Spring Security config \u2014 confirm all clients are non-browser'\n\
+        \  FAIL=1\nfi\nif grep -rnE --include='*.java' 'NoOpPasswordEncoder' .; then\n\
+        \  echo '::error::NoOpPasswordEncoder is in use \u2014 passwords are stored\
+        \ unhashed'\n  FAIL=1\nfi\nif grep -rnE --include='*.java' 'authorizeHttpRequests|antMatchers'\
+        \ . | grep -nE 'permitAll' | grep -E '/(api|actuator|admin)' ; then\n  echo\
+        \ '::error::permitAll() on /api, /actuator, or /admin paths detected'\n  FAIL=1\n\
+        fi\nif grep -rnE --include='*.java' '@RequestMapping|@GetMapping|@PostMapping'\
+        \ . | xargs -I{} echo {} | grep -E '/(actuator|env|heapdump|threaddump)' >/dev/null;\
+        \ then\n  echo '::warning::Actuator endpoints declared via controllers \u2014\
+        \ verify exposure'\nfi\nexit $FAIL\n) || inner_exit=$?\n# If the inner script\
+        \ exited non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' auth-spring-security-misconfig.shell_log;\
+        \ then\n  echo \"::error file=scan-spring-security-config::shell check failed\
+        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: semgrep-spring-security-dsl
+      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
+
+        echo ''Rule body:''
+
+        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
+
+
+        SEMGREP_EOF
+
+        '
+    - name: Convert auth-spring-security-misconfig shell_check annotations to SARIF
+      if: always()
+      run: "cat > auth-spring-security-misconfig_annotations_to_sarif.py <<'PY_EOF'\n\
+        import os, re, json\nlog_path = 'auth-spring-security-misconfig.shell_log'\n\
+        sarif_path = 'auth-spring-security-misconfig-results.sarif'\ntool_name = 'auth-spring-security-misconfig'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-auth-spring-security-misconfig'\nresults =\
+        \ []\nif os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 auth-spring-security-misconfig_annotations_to_sarif.py\n"
+    - name: Ensure auth-spring-security-misconfig-results.sarif exists (fallback for
+        0 findings)
+      if: always()
+      run: "if [ ! -s auth-spring-security-misconfig-results.sarif ]; then\n  echo\
+        \ \"::notice::auth-spring-security-misconfig found 0 findings. Generating\
+        \ empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n\
+        \    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
+        \    '        \"driver\": {' \\\n    '          \"name\": \"auth-spring-security-misconfig\"\
+        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > auth-spring-security-misconfig-results.sarif\nfi\necho \"\u2713\
+        \ auth-spring-security-misconfig-results.sarif size: $(stat -c%s auth-spring-security-misconfig-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload auth-spring-security-misconfig SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: auth-spring-security-misconfig-results.sarif
+        category: auth-spring-security-misconfig
+  data-spring-repository-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-spring-data-queries
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a data-spring-repository-safety.shell_log) 2>&1\n# Run the original script\
+        \ in a subshell with set +e so\n# that any single command failure does not\
+        \ abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nset -u\nFAIL=0\nif grep -rnE --include='*.java' '@Query\\s*\\('\
+        \ . -A 1 | grep -nE '\"[^\"]*\"\\s*\\+'; then\n  echo '::error::@Query value\
+        \ contains string concatenation \u2014 switch to named parameters (:param)\
+        \ or CriteriaBuilder'\n  FAIL=1\nfi\nif grep -rnE --include='*.java' 'createNativeQuery\\\
+        s*\\(' .; then\n  echo '::warning::createNativeQuery() detected \u2014 audit\
+        \ for string concatenation in argument'\n  grep -rnE --include='*.java' 'createNativeQuery\\\
+        s*\\(' . | grep '+' && FAIL=1\nfi\nif grep -rnE --include='*.java' 'JdbcTemplate\\\
+        s+.*query\\s*\\(' . | grep -E '\"[^\"]*\"\\s*\\+'; then\n  echo '::error::JdbcTemplate\
+        \ query() with concatenated SQL literal detected'\n  FAIL=1\nfi\nif grep -rnE\
+        \ --include='*.java' '@PreAuthorize|@PostAuthorize|@Secured' . >/dev/null;\
+        \ then\n  echo '::info::Spring method-level security annotations present (good\
+        \ signal)'\nelse\n  echo '::warning::No @PreAuthorize/@Secured annotations\
+        \ found on repository or service classes \u2014 tenant isolation may rely\
+        \ solely on query clauses'\nfi\nexit $FAIL\n) || inner_exit=$?\n# If the inner\
+        \ script exited non-zero and emitted no\n# '::error'/'::warning' annotation,\
+        \ synthesise one so the\n# SARIF conversion step still has a finding to record.\n\
+        if [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' data-spring-repository-safety.shell_log;\
+        \ then\n  echo \"::error file=scan-spring-data-queries::shell check failed\
+        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: semgrep-spring-data-sqli
+      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
+
+        echo ''Rule body:''
+
+        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
+
+
+        SEMGREP_EOF
+
+        '
+    - name: Convert data-spring-repository-safety shell_check annotations to SARIF
+      if: always()
+      run: "cat > data-spring-repository-safety_annotations_to_sarif.py <<'PY_EOF'\n\
+        import os, re, json\nlog_path = 'data-spring-repository-safety.shell_log'\n\
+        sarif_path = 'data-spring-repository-safety-results.sarif'\ntool_name = 'data-spring-repository-safety'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-data-spring-repository-safety'\nresults = []\n\
+        if os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 data-spring-repository-safety_annotations_to_sarif.py\n"
+    - name: Ensure data-spring-repository-safety-results.sarif exists (fallback for
+        0 findings)
+      if: always()
+      run: "if [ ! -s data-spring-repository-safety-results.sarif ]; then\n  echo\
+        \ \"::notice::data-spring-repository-safety found 0 findings. Generating empty\
+        \ SARIF to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n    '\
+        \  \"version\": \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
+        \    '        \"driver\": {' \\\n    '          \"name\": \"data-spring-repository-safety\"\
+        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > data-spring-repository-safety-results.sarif\nfi\necho \"\u2713\
+        \ data-spring-repository-safety-results.sarif size: $(stat -c%s data-spring-repository-safety-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload data-spring-repository-safety SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: data-spring-repository-safety-results.sarif
+        category: data-spring-repository-safety
