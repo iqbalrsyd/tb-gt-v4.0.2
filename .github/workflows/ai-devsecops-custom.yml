@@ -20,45 +20,35 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: scan-mqtt-broker-urls
+    - name: scan-for-plaintext-mqtt-bindings
       run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
         \ -a iot-mqtt-tls.shell_log) 2>&1\n# Run the original script in a subshell\
         \ with set +e so\n# that any single command failure does not abort the\n#\
         \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
-        mkdir -p sarif-output\nRESULTS=\"iot-mqtt-results.sarif\"\n: > \"$RESULTS\"\
-        \n\n# 1) Detect plaintext tcp:// MQTT broker URLs in source and config\nfind\
-        \ . -type f \\( -name \"*.yml\" -o -name \"*.yaml\" -o -name \"*.properties\"\
-        \ -o -name \"*.java\" \\) \\\n  -not -path \"*/target/*\" -not -path \"*/.git/*\"\
-        \ -not -path \"*/node_modules/*\" \\\n  -print0 2>/dev/null | xargs -0 grep\
-        \ -lE \"(tcp://[A-Za-z0-9._-]+:[0-9]+|tcp://broker|tcp://mosquitto|tcp://emqx|tcp://hivemq)\"\
-        \ 2>/dev/null | while read -r f; do\n  if grep -qiE \"(mqtt|paho|broker|emqx|mosquitto|hivemq)\"\
-        \ \"$f\"; then\n    echo \"[mqtt-tls] ::error file=$f::Insecure MQTT broker\
-        \ URL (tcp://) detected \u2014 use ssl:// with broker certificate verification\"\
-        \n    grep -nE \"tcp://[A-Za-z0-9._-]+:[0-9]+\" \"$f\" | while IFS=: read\
-        \ -r line content; do\n      jq -n --arg rule \"iot-mqtt-plaintext-tcp\" \\\
-        \n        --arg uri \"$f\" --argjson line \"$line\" \\\n        --arg msg\
-        \ \"MQTT broker URL uses plaintext tcp:// \u2014 TLS (ssl://) is required\
-        \ for device telemetry confidentiality and integrity.\" \\\n        '{ruleId:$rule,\
-        \ level:\"error\", message:{text:$msg}, locations:[{physicalLocation:{artifactLocation:{uri:$uri},\
-        \ region:{startLine:$line}}}]}' >> \"$RESULTS\"\n    done\n  fi\ndone\n\n\
-        # 2) Verify MQTT TLS material is actually configured (truststore / keystore\
-        \ references)\nif ! grep -rqE \"(ssl\\.truststore|trustStore\\s*=|com\\.ibm\\\
-        .mqtt.*ssl|ssl\\.properties)\" --include=\"*.yml\" --include=\"*.yaml\" --include=\"\
-        *.properties\" --include=\"*.java\" --exclude-dir=target --exclude-dir=.git\
-        \ . 2>/dev/null; then\n  echo \"[mqtt-tls] ::warning::No MQTT truststore/keystore\
-        \ configuration detected in any Spring config or Java source \u2014 Paho will\
-        \ fail TLS verification or fall back to plaintext\"\n  jq -n '{ruleId:\"iot-mqtt-missing-truststore\"\
-        , level:\"warning\", message:{text:\"No MQTT truststore/keystore reference\
-        \ found. Paho MQTT client cannot verify broker certificate; clients will either\
-        \ reject connection or silently disable TLS.\"}, locations:[]}' >> \"$RESULTS\"\
-        \nfi\n\n# Wrap in SARIF envelope\necho \"[mqtt-tls] Wrote $(wc -l < $RESULTS)\
-        \ findings to $RESULTS\"\n) || inner_exit=$?\n# If the inner script exited\
-        \ non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
-        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
-        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' iot-mqtt-tls.shell_log;\
-        \ then\n  echo \"::error file=scan-mqtt-broker-urls::shell check failed (exit\
-        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
-    - name: semgrep-paho-plain-conn
+        found=0\n# 1. YAML/properties: any MQTT bind on 1883 without matching 8883\
+        \ TLS port is a finding\necho \"::group::Scanning deployment configs for plaintext\
+        \ MQTT port 1883\"\ngrep -rEn --include='*.yml' --include='*.yaml' --include='*.properties'\
+        \ \\\n  '1883' docker/ application/ src/main/resources/ 2>/dev/null \\\n \
+        \ | grep -iE 'mqtt' || true\necho \"::endgroup::\"\n\n# 2. Java: MqttConnectOptions\
+        \ without SSL config is a finding\necho \"::group::Scanning Java sources for\
+        \ unsecured MQTT client construction\"\ngrep -rEn --include='*.java' \\\n\
+        \  'MqttClient\\(|MqttAsyncClient\\(|new MqttConnectOptions\\(\\)' \\\n  application/\
+        \ src/main/java/ 2>/dev/null \\\n  | grep -v 'SslContext' || true\n\n# 3.\
+        \ MqttConnectOptions usage without setSocketFactory(SSL)\ngrep -rEn --include='*.java'\
+        \ -A2 'MqttConnectOptions\\s+\\w+\\s*=\\s*new\\s+MqttConnectOptions' \\\n\
+        \  application/ src/main/java/ 2>/dev/null \\\n  | grep -v 'setSocketFactory'\
+        \ || true\n\n# Fail if any plaintext patterns found without TLS counterpart\n\
+        if grep -rEn --include='*.yml' --include='*.yaml' '1883' docker/ 2>/dev/null\
+        \ | grep -qiE 'mqtt' \\\n   && ! grep -rEn --include='*.yml' --include='*.yaml'\
+        \ '8883' docker/ 2>/dev/null | grep -qiE 'mqtt'; then\n  echo \"::error::MQTT\
+        \ broker bound on plaintext 1883 without TLS 8883 pair\"\n  exit 1\nfi\n)\
+        \ || inner_exit=$?\n# If the inner script exited non-zero and emitted no\n\
+        # '::error'/'::warning' annotation, synthesise one so the\n# SARIF conversion\
+        \ step still has a finding to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep\
+        \ -qE '^::(error|warning)' iot-mqtt-tls.shell_log; then\n  echo \"::error\
+        \ file=scan-for-plaintext-mqtt-bindings::shell check failed (exit code $inner_exit)\
+        \ \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: detect-mqtt-without-ssl
       run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
 
         echo ''Rule body:''
@@ -135,7 +125,7 @@ jobs:
       with:
         sarif_file: iot-mqtt-tls-results.sarif
         category: iot-mqtt-tls
-  container-compose-port-exposure:
+  auth-default-credentials:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -144,64 +134,36 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: scan-compose-sensitive-ports
+    - name: grep-default-credentials-and-permitall
       run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
-        \ -a container-compose-port-exposure.shell_log) 2>&1\n# Run the original script\
-        \ in a subshell with set +e so\n# that any single command failure does not\
-        \ abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
-        ( set +e\nmkdir -p sarif-output\nRESULTS=\"compose-port-results.sarif\"\n\
-        : > \"$RESULTS\"\n\nSENSITIVE='cassandra|postgres|postgresql|redis|kafka|rabbitmq|mongodb|mysql|opentsdb|edqs|thingsboard|node|zookeeper'\n\
-        \n# Iterate over the docker-compose tree (root + sub-overrides)\nfor f in\
-        \ $(find . -maxdepth 4 -type f \\( -name \"docker-compose*.yml\" -o -name\
-        \ \"docker-compose*.yaml\" \\) -not -path \"*/.git/*\" 2>/dev/null); do\n\
-        \  python3 - \"$f\" \"$RESULTS\" <<'PY'\nimport re, sys, json\ncompose_file,\
-        \ results_file = sys.argv[1], sys.argv[2]\ntry:\n    with open(compose_file)\
-        \ as fp:\n        text = fp.read()\nexcept Exception:\n    sys.exit(0)\n\n\
-        # Minimal YAML-ish parser: track current top-level service key when we enter\
-        \ a services: mapping.\nlines = text.splitlines()\nin_services = False\ncur_service\
-        \ = None\nin_ports = False\nports_indent = 0\nSENSITIVE = re.compile(r'(?i)(cassandra|postgres|postgresql|redis|kafka|rabbitmq|mongodb|mysql|opentsdb|edqs|thingsboard|node|zookeeper)')\n\
-        \ndef emit(uri, line, msg, rule):\n    rec = {\"ruleId\": rule, \"level\"\
-        : \"error\", \"message\": {\"text\": msg}, \"locations\": [{\"physicalLocation\"\
-        : {\"artifactLocation\": {\"uri\": uri}, \"region\": {\"startLine\": line}}}]}\n\
-        \    with open(results_file, 'a') as f:\n        f.write(json.dumps(rec) +\
-        \ \"\\n\")\n\nfor i, raw in enumerate(lines, 1):\n    line = raw.rstrip()\n\
-        \    if not line.strip() or line.lstrip().startswith('#'):\n        continue\n\
-        \    stripped = line.lstrip()\n    indent = len(line) - len(stripped)\n  \
-        \  if indent == 0:\n        if stripped == 'services:':\n            in_services\
-        \ = True\n        else:\n            in_services = False\n        in_ports\
-        \ = False\n        cur_service = None\n        continue\n    if not in_services:\n\
-        \        continue\n    if indent == 2 and stripped.endswith(':') and not stripped.startswith('-'):\n\
-        \        cur_service = stripped[:-1]\n        in_ports = False\n        continue\n\
-        \    if indent == 4 and stripped == 'ports:':\n        in_ports = True\n \
-        \       ports_indent = 6\n        continue\n    if in_ports:\n        if indent\
-        \ < ports_indent:\n            in_ports = False\n            continue\n  \
-        \      m = re.search(r'\"?([0-9]{1,3}(?:\\.[0-9]{1,3}){0,3}:)?([0-9]{2,5}):([0-9]{2,5})\"\
-        ?', stripped)\n        if m and cur_service and SENSITIVE.search(cur_service):\n\
-        \            host = m.group(1).rstrip(':') if m.group(1) else None\n     \
-        \       # 0.0.0.0 host binding OR short-syntax \"PORT:PORT\" (binds to 0.0.0.0\
-        \ by default in Docker)\n            if host in (None, '0.0.0.0') or re.match(r'^\\\
-        d+:\\d+', stripped.strip()):\n                emit(compose_file, i,\n    \
-        \                 f\"Sensitive service '{cur_service}' exposes a data port\
-        \ ({m.group(2)}:{m.group(3)}) in {compose_file}. Use 'expose' instead of 'ports',\
-        \ bind to 127.0.0.1, or place behind a TLS-terminating reverse proxy.\",\n\
-        \                     \"container-compose-sensitive-port-public\")\nPY\ndone\n\
-        \n# Also check for missing authentication env on Postgres / Cassandra service\
-        \ blocks\nfor f in $(find . -maxdepth 4 -type f \\( -name \"docker-compose*.yml\"\
-        \ -o -name \"docker-compose*.yaml\" \\) -not -path \"*/.git/*\" 2>/dev/null);\
-        \ do\n  if grep -qiE \"(postgres|postgresql|cassandra)\" \"$f\"; then\n  \
-        \  if ! grep -qiE \"(POSTGRES_PASSWORD|CASSANDRA_PASSWORD|authentication_params|PasswordAuthenticator)\"\
-        \ \"$f\"; then\n      jq -n --arg uri \"$f\" \\\n        '{ruleId:\"container-compose-db-no-auth-env\"\
-        , level:\"warning\", message:{text:\"Postgres/Cassandra service block does\
-        \ not declare a *_PASSWORD / authenticator env var \u2014 DB may start with\
-        \ default or anonymous access.\"}, locations:[{physicalLocation:{artifactLocation:{uri:$uri}}}]}'\
-        \ >> \"$RESULTS\"\n    fi\n  fi\ndone\n\necho \"[compose-ports] Wrote $(wc\
-        \ -l < $RESULTS) findings to $RESULTS\"\n) || inner_exit=$?\n# If the inner\
-        \ script exited non-zero and emitted no\n# '::error'/'::warning' annotation,\
-        \ synthesise one so the\n# SARIF conversion step still has a finding to record.\n\
-        if [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' container-compose-port-exposure.shell_log;\
-        \ then\n  echo \"::error file=scan-compose-sensitive-ports::shell check failed\
-        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
-    - name: semgrep-compose-public-port
+        \ -a auth-default-credentials.shell_log) 2>&1\n# Run the original script in\
+        \ a subshell with set +e so\n# that any single command failure does not abort\
+        \ the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\n# 1. Hardcoded default tenant / SYS_ADMIN credentials in Java/YAML/SQL\n\
+        echo \"::group::Scanning for default ThingsBoard credentials\"\ngrep -rEn\
+        \ --include='*.java' --include='*.yml' --include='*.yaml' --include='*.sql'\
+        \ --include='*.xml' \\\n  -e 'tenant@thingsboard\\.org' \\\n  -e 'sysadmin@thingsboard\\\
+        .org' \\\n  -e '\"tenant\"' \\\n  -e '\"sysadmin\"' \\\n  application/ src/main/\
+        \ 2>/dev/null || true\n\n# 2. SecurityConfig with broad permitAll on /api/**\
+        \ or /** (auth bypass risk)\necho \"::group::Scanning SecurityConfig for permitAll\
+        \ on API paths\"\ngrep -rEn --include='*.java' \\\n  -B1 -A1 'antMatchers\\\
+        (\"/api/\\*\\*\"\\)\\.permitAll\\(\\)|antMatchers\\(\"/\\*\\*\"\\)\\.permitAll\\\
+        (\\)' \\\n  application/ src/main/java/ 2>/dev/null || true\n\n# 3. application.yml\
+        \ with default password literals (NOT placeholders)\ngrep -rEn --include='*.yml'\
+        \ --include='*.yaml' --include='*.properties' \\\n  -E 'password:\\s*[\"'\\\
+        ''](?!.*\\$\\{)(tenant|sysadmin|admin|changeme|thingsboard)' \\\n  application/\
+        \ src/main/resources/ 2>/dev/null || true\n\nfail=0\ngrep -rEn --include='*.java'\
+        \ --include='*.sql' \\\n  -e 'tenant@thingsboard\\.org' -e 'sysadmin@thingsboard\\\
+        .org' \\\n  application/ src/main/ 2>/dev/null && fail=1\nif [ $fail -eq 1\
+        \ ]; then\n  echo \"::error::Default platform credentials hardcoded in source\"\
+        \n  exit 1\nfi\n) || inner_exit=$?\n# If the inner script exited non-zero\
+        \ and emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' auth-default-credentials.shell_log;\
+        \ then\n  echo \"::error file=grep-default-credentials-and-permitall::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: detect-spring-security-bypass
       run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
 
         echo ''Rule body:''
@@ -212,21 +174,21 @@ jobs:
         SEMGREP_EOF
 
         '
-    - name: Convert container-compose-port-exposure shell_check annotations to SARIF
+    - name: Convert auth-default-credentials shell_check annotations to SARIF
       if: always()
-      run: "cat > container-compose-port-exposure_annotations_to_sarif.py <<'PY_EOF'\n\
-        import os, re, json\nlog_path = 'container-compose-port-exposure.shell_log'\n\
-        sarif_path = 'container-compose-port-exposure-results.sarif'\ntool_name =\
-        \ 'container-compose-port-exposure'\ntool_version = '1.0.0'\ninformation_uri\
-        \ = 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-container-compose-port-exposure'\n\
-        results = []\nif os.path.exists(log_path):\n    pat = re.compile(\n      \
-        \  r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
-        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
-        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
-        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
-        \        sl = None\n        el = None\n        title = None\n        if props:\n\
-        \            for kv in props.split(','):\n                if '=' in kv:\n\
-        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+      run: "cat > auth-default-credentials_annotations_to_sarif.py <<'PY_EOF'\nimport\
+        \ os, re, json\nlog_path = 'auth-default-credentials.shell_log'\nsarif_path\
+        \ = 'auth-default-credentials-results.sarif'\ntool_name = 'auth-default-credentials'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-auth-default-credentials'\nresults = []\nif\
+        \ os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
         \                    v = v.strip()\n                    if k == 'file':\n\
         \                        path = v\n                    elif k == 'line':\n\
         \                        try:\n                            sl = int(v)\n \
@@ -260,29 +222,27 @@ jobs:
         existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
         \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
         \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 container-compose-port-exposure_annotations_to_sarif.py\n"
-    - name: Ensure container-compose-port-exposure-results.sarif exists (fallback
-        for 0 findings)
+        PY_EOF\npython3 auth-default-credentials_annotations_to_sarif.py\n"
+    - name: Ensure auth-default-credentials-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s container-compose-port-exposure-results.sarif ]; then\n  echo\
-        \ \"::notice::container-compose-port-exposure found 0 findings. Generating\
-        \ empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n\
-        \    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
-        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
-        \    '        \"driver\": {' \\\n    '          \"name\": \"container-compose-port-exposure\"\
-        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+      run: "if [ ! -s auth-default-credentials-results.sarif ]; then\n  echo \"::notice::auth-default-credentials\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"auth-default-credentials\",' \\\n    '\
+        \          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
         : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
         \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
-        \n    '}' > container-compose-port-exposure-results.sarif\nfi\necho \"\u2713\
-        \ container-compose-port-exposure-results.sarif size: $(stat -c%s container-compose-port-exposure-results.sarif)\
-        \ bytes\"\n"
-    - name: Upload container-compose-port-exposure SARIF to GitHub Code Scanning
+        \n    '}' > auth-default-credentials-results.sarif\nfi\necho \"\u2713 auth-default-credentials-results.sarif\
+        \ size: $(stat -c%s auth-default-credentials-results.sarif) bytes\"\n"
+    - name: Upload auth-default-credentials SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: container-compose-port-exposure-results.sarif
-        category: container-compose-port-exposure
-  auth-weak-jwt-signing-key:
+        sarif_file: auth-default-credentials-results.sarif
+        category: auth-default-credentials
+  data-cassandra-cql-injection:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -291,57 +251,35 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: scan-jwt-signing-keys
+    - name: grep-cql-and-jpa-injection-sinks
       run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
-        \ -a auth-weak-jwt-signing-key.shell_log) 2>&1\n# Run the original script\
+        \ -a data-cassandra-cql-injection.shell_log) 2>&1\n# Run the original script\
         \ in a subshell with set +e so\n# that any single command failure does not\
         \ abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
-        ( set +e\nmkdir -p sarif-output\nRESULTS=\"auth-jwt-results.sarif\"\n: > \"\
-        $RESULTS\"\n\n# 1) Short / weak signing keys in Spring config and Java sources\n\
-        find . -type f \\( -name \"*.yml\" -o -name \"*.yaml\" -o -name \"*.properties\"\
-        \ -o -name \"*.java\" \\) \\\n  -not -path \"*/target/*\" -not -path \"*/.git/*\"\
-        \ -not -path \"*/node_modules/*\" \\\n  -print0 2>/dev/null | xargs -0 grep\
-        \ -nE \"(jwt\\.secret|JWT_SECRET|signing[_-]?key|secret[_-]?key|token[_-]?signing[_-]?key|JWT_SIGNING_KEY)\"\
-        \ 2>/dev/null | \\\n  while IFS=: read -r f line content; do\n    # Extract\
-        \ the value after : or =, strip quotes and ${} placeholders\n    val=$(echo\
-        \ \"$content\" | sed -E \"s/.*(jwt\\.secret|JWT_SECRET|signing[_-]?key|secret[_-]?key|token[_-]?signing[_-]?key|JWT_SIGNING_KEY)['\\\
-        \"]?\\s*[:=]\\s*//\" | tr -d '\\\"' | tr -d \"'\" | awk '{print $1}')\n  \
-        \  # Ignore ${ENV_VAR} references (env-sourced = good)\n    if echo \"$val\"\
-        \ | grep -qE '^\\$\\{.*\\}$'; then\n      continue\n    fi\n    if [ -n \"\
-        $val\" ] && [ \"${#val}\" -lt 32 ]; then\n      jq -n --arg uri \"$f\" --argjson\
-        \ line \"$line\" \\\n        --arg msg \"JWT/signing key is only ${#val} characters\
-        \ (need \u2265 32 bytes / 256 bits for HS256). An attacker can brute-force\
-        \ or trivially forge tokens.\" \\\n        '{ruleId:\"auth-jwt-short-signing-key\"\
-        , level:\"error\", message:{text:$msg}, locations:[{physicalLocation:{artifactLocation:{uri:$uri},\
-        \ region:{startLine:$line}}}]}' >> \"$RESULTS\"\n    fi\n  done\n\n# 2) Disallow\
-        \ `alg: none` literal in JWT-handling Java code\nfind . -type f -name \"*.java\"\
-        \ -not -path \"*/target/*\" -not -path \"*/.git/*\" \\\n  -print0 2>/dev/null\
-        \ | xargs -0 grep -nE \"(\\\"none\\\"|SignatureAlgorithm\\.NONE|Algorithm\\\
-        .none|JwsHeader\\.ALGORITHM.*none)\" 2>/dev/null | \\\n  while IFS=: read\
-        \ -r f line content; do\n    jq -n --arg uri \"$f\" --argjson line \"$line\"\
-        \ \\\n      --arg msg \"JWT 'none' algorithm reference detected \u2014 tokens\
-        \ would be accepted unsigned. Remove or restrict to RS256/ES256.\" \\\n  \
-        \    '{ruleId:\"auth-jwt-alg-none\", level:\"error\", message:{text:$msg},\
-        \ locations:[{physicalLocation:{artifactLocation:{uri:$uri}, region:{startLine:$line}}}]}'\
-        \ >> \"$RESULTS\"\n  done\n\n# 3) Spring Security permitAll() on /api/** (common\
-        \ regression in monolithic IoT platforms)\nfind . -type f -name \"*.java\"\
-        \ -not -path \"*/target/*\" -not -path \"*/.git/*\" \\\n  -print0 2>/dev/null\
-        \ | xargs -0 grep -nE \"(authorizeHttpRequests|antMatchers|requestMatchers).*permitAll\"\
-        \ 2>/dev/null | \\\n  grep -E \"(/api|/v1|/v2|/v3|/rpc|grpc)\" | \\\n  while\
-        \ IFS=: read -r f line content; do\n    jq -n --arg uri \"$f\" --argjson line\
-        \ \"$line\" \\\n      --arg msg \"permitAll() applied to an API / RPC path.\
-        \ Ensure this is intentional; otherwise an unauthenticated attacker can reach\
-        \ tenant endpoints.\" \\\n      '{ruleId:\"auth-permitall-api\", level:\"\
-        warning\", message:{text:$msg}, locations:[{physicalLocation:{artifactLocation:{uri:$uri},\
-        \ region:{startLine:$line}}}]}' >> \"$RESULTS\"\n  done\n\necho \"[auth-jwt]\
-        \ Wrote $(wc -l < $RESULTS) findings to $RESULTS\"\n) || inner_exit=$?\n#\
-        \ If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
-        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
-        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
-        \ auth-weak-jwt-signing-key.shell_log; then\n  echo \"::error file=scan-jwt-signing-keys::shell\
-        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
-        fi\nexit $inner_exit\n"
-    - name: semgrep-jwt-short-key
+        ( set +e\n# 1. @Query nativeQuery=true with string concatenation in CQL/Java\n\
+        echo \"::group::Scanning @Query native CQL for concatenation\"\ngrep -rEn\
+        \ --include='*.java' -A2 'nativeQuery\\s*=\\s*true' \\\n  application/ src/main/java/\
+        \ 2>/dev/null \\\n  | grep -E '\"\\s*\\+\\s*\\w' || true\n\n# 2. ${...} SpEL\
+        \ inside @Query (parameter binding bypass)\ngrep -rEn --include='*.java' -B1\
+        \ -A3 '@Query' \\\n  application/ src/main/java/ 2>/dev/null \\\n  | grep\
+        \ -E '\\$\\{[^}]+\\}' || true\n\n# 3. Cassandra Session.execute( with concatenated\
+        \ String arg\ngrep -rEn --include='*.java' \\\n  -e 'Session\\s+\\w+\\s*;.*execute\\\
+        (\\s*\"' \\\n  -e '\\.execute\\(\\s*\"\\s*\\+\\s*' \\\n  application/ src/main/java/\
+        \ 2>/dev/null || true\n\n# 4. Cassandra port 9042 exposed on 0.0.0.0 in compose\
+        \ (no auth by default on bind)\ngrep -rEn --include='*.yml' --include='*.yaml'\
+        \ \\\n  -B1 -A3 '9042:9042' docker/ 2>/dev/null \\\n  | grep -E '0\\.0\\.0\\\
+        .0|::' || true\n\nfail=0\ngrep -rEn --include='*.java' -A2 'nativeQuery\\\
+        s*=\\s*true' \\\n  application/ src/main/java/ 2>/dev/null | grep -qE '\"\\\
+        s*\\+\\s*\\w' && fail=1\nif [ $fail -eq 1 ]; then\n  echo \"::error::Native\
+        \ CQL/SQL query built with string concatenation (CQL injection risk)\"\n \
+        \ exit 1\nfi\n) || inner_exit=$?\n# If the inner script exited non-zero and\
+        \ emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' data-cassandra-cql-injection.shell_log;\
+        \ then\n  echo \"::error file=grep-cql-and-jpa-injection-sinks::shell check\
+        \ failed (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit\
+        \ $inner_exit\n"
+    - name: detect-cql-jpa-injection
       run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
 
         echo ''Rule body:''
@@ -352,13 +290,13 @@ jobs:
         SEMGREP_EOF
 
         '
-    - name: Convert auth-weak-jwt-signing-key shell_check annotations to SARIF
+    - name: Convert data-cassandra-cql-injection shell_check annotations to SARIF
       if: always()
-      run: "cat > auth-weak-jwt-signing-key_annotations_to_sarif.py <<'PY_EOF'\nimport\
-        \ os, re, json\nlog_path = 'auth-weak-jwt-signing-key.shell_log'\nsarif_path\
-        \ = 'auth-weak-jwt-signing-key-results.sarif'\ntool_name = 'auth-weak-jwt-signing-key'\n\
+      run: "cat > data-cassandra-cql-injection_annotations_to_sarif.py <<'PY_EOF'\n\
+        import os, re, json\nlog_path = 'data-cassandra-cql-injection.shell_log'\n\
+        sarif_path = 'data-cassandra-cql-injection-results.sarif'\ntool_name = 'data-cassandra-cql-injection'\n\
         tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
-        rule_id_prefix = 'ai-devsecops-auth-weak-jwt-signing-key'\nresults = []\n\
+        rule_id_prefix = 'ai-devsecops-data-cassandra-cql-injection'\nresults = []\n\
         if os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
         s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
         \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
@@ -400,24 +338,25 @@ jobs:
         existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
         \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
         \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 auth-weak-jwt-signing-key_annotations_to_sarif.py\n"
-    - name: Ensure auth-weak-jwt-signing-key-results.sarif exists (fallback for 0
-        findings)
+        PY_EOF\npython3 data-cassandra-cql-injection_annotations_to_sarif.py\n"
+    - name: Ensure data-cassandra-cql-injection-results.sarif exists (fallback for
+        0 findings)
       if: always()
-      run: "if [ ! -s auth-weak-jwt-signing-key-results.sarif ]; then\n  echo \"::notice::auth-weak-jwt-signing-key\
-        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
-        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
-        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
-        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"auth-weak-jwt-signing-key\",' \\\n   \
-        \ '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+      run: "if [ ! -s data-cassandra-cql-injection-results.sarif ]; then\n  echo \"\
+        ::notice::data-cassandra-cql-injection found 0 findings. Generating empty\
+        \ SARIF to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n    '\
+        \  \"version\": \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
+        \    '        \"driver\": {' \\\n    '          \"name\": \"data-cassandra-cql-injection\"\
+        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
         : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
         \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
-        \n    '}' > auth-weak-jwt-signing-key-results.sarif\nfi\necho \"\u2713 auth-weak-jwt-signing-key-results.sarif\
-        \ size: $(stat -c%s auth-weak-jwt-signing-key-results.sarif) bytes\"\n"
-    - name: Upload auth-weak-jwt-signing-key SARIF to GitHub Code Scanning
+        \n    '}' > data-cassandra-cql-injection-results.sarif\nfi\necho \"\u2713\
+        \ data-cassandra-cql-injection-results.sarif size: $(stat -c%s data-cassandra-cql-injection-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload data-cassandra-cql-injection SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: auth-weak-jwt-signing-key-results.sarif
-        category: auth-weak-jwt-signing-key
+        sarif_file: data-cassandra-cql-injection-results.sarif
+        category: data-cassandra-cql-injection
