@@ -43,8 +43,8 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: Run JUnit 5 (Jupiter)
-      run: echo 'Test execution for JUnit 5 (Jupiter)'
+    - name: Run JUnit (inferred from Spring Boot conventions)
+      run: echo 'Test execution for JUnit (inferred from Spring Boot conventions)'
   sast:
     runs-on: ubuntu-latest
     timeout-minutes: 20
